@@ -2510,6 +2510,78 @@ const componentKey = (key: string) =>
         .replace(/[^a-zA-Z0-9_]/g, '_')
         .toLowerCase()
 
+/*
+ * FAKPK21021/BDH_D39301_KR are the Korean split-device WashTower models.
+ * Unlike WTL_FXU_BDV_NA_01, they use separate AA FF extended records (0xEB/
+ * 0xEC) for the washer and dryer, so the WTL handler cannot be reused.  Keep
+ * the Home Assistant surface aligned with WTL's useful entities, however:
+ * publish appliance state, cycle/time, errors and operator-facing flags only.
+ * The large protocol maps remain an internal codec/control description.
+ */
+const COMMON_PUBLIC_FIELDS = [
+    'state',
+    'course',
+    'reserveTimeMinute',
+    'remainTimeMinute',
+    'initialTimeMinute',
+    'error',
+    'childLock',
+    'doorLock',
+    'remoteStart',
+] as const
+
+const publicFieldKeys = (model: WashTowerModel) =>
+    new Set<string>(model.tag === 0x33 ? [...COMMON_PUBLIC_FIELDS, 'doorClose'] : COMMON_PUBLIC_FIELDS)
+
+const publicEntityKey = (fieldKey: string) =>
+    ({
+        reserveTimeMinute: 'reserve_time',
+        remainTimeMinute: 'remaining_time',
+        initialTimeMinute: 'initial_time',
+        doorClose: 'door',
+    })[fieldKey] ?? componentKey(fieldKey)
+
+const trackedFieldKeys = (model: WashTowerModel) =>
+    new Set<string>([
+        ...publicFieldKeys(model),
+        ...(model.tag === 0x33 ? WASHER_SETTING_KEYS : DRYER_SETTING_KEYS),
+        'remoteMaintain',
+        'baseDownloadCourseData',
+        'downloadCourse',
+        'moreLessTime',
+        'dryLevel',
+    ])
+
+function fieldComponent(field: Field): DeviceDiscovery['components'][string] {
+    const key = publicEntityKey(field.key)
+    const component: Record<string, unknown> = {
+        platform: 'sensor',
+        unique_id: '$deviceid-' + key,
+        state_topic: '$this/' + key,
+        name: field.label,
+    }
+    if (field.key.endsWith('TimeMinute')) {
+        component.device_class = 'duration'
+        component.unit_of_measurement = 'min'
+    } else if (field.key === 'state' || field.key === 'course' || field.key === 'error') {
+        component.device_class = 'enum'
+        component.options = [...new Set([...Object.values(field.values ?? {}), 'unknown'])]
+    } else if (field.key === 'doorClose') {
+        component.platform = 'binary_sensor'
+        component.device_class = 'door'
+        // The record bit means "closed"; HA's door binary sensor is ON when open.
+        component.payload_on = 'Off'
+        component.payload_off = 'On'
+        component.name = 'Door'
+    } else if (field.key === 'childLock' || field.key === 'doorLock' || field.key === 'remoteStart') {
+        component.platform = 'binary_sensor'
+        component.payload_on = 'On'
+        component.payload_off = 'Off'
+        component.icon = field.key === 'remoteStart' ? 'mdi:remote' : 'mdi:lock-outline'
+    }
+    return component as DeviceDiscovery['components'][string]
+}
+
 const DECLARED_NON_PACKET_FIELDS: Record<'221' | '222', string[]> = {
     '221': [
         'extendedControlTest',
@@ -2596,6 +2668,7 @@ function implementationIdentity(
     >,
 ): ImplementationIdentity {
     const mapped = model.fields.filter((field) => field.offset + field.length <= model.recordLength)
+    const exposed = mapped.filter((field) => publicFieldKeys(model).has(field.key))
     return {
         ...identity,
         packetMappedFields: mapped.map((field) => field.key),
@@ -2610,15 +2683,15 @@ function implementationIdentity(
             .filter((field) => field.offset + field.length > model.recordLength)
             .map((field) => field.key)
             .concat(DECLARED_NON_PACKET_FIELDS[identity.deviceType]),
-        entities: mapped
+        entities: exposed
             .map((field) => ({
-                key: componentKey(field.key),
+                key: publicEntityKey(field.key),
                 label: field.label,
             }))
             .concat({ key: 'power_transition', label: 'Power transition state' }),
-        enumOptions: mapped.flatMap((field) =>
+        enumOptions: exposed.flatMap((field) =>
             Object.entries(field.values ?? {}).map(([value, label]) => ({
-                entityKey: componentKey(field.key),
+                entityKey: publicEntityKey(field.key),
                 value: Number(value),
                 label,
             })),
@@ -2680,8 +2753,8 @@ function implementationIdentity(
 }
 
 /**
- * Release validator contract. It is derived from the exact field tables above, so
- * the evidence ledger and the driver cannot silently drift apart.
+ * Protocol/evidence identity used by release validation. Public entities are
+ * deliberately limited to the hand-picked HA surface above.
  */
 export const WASHTOWER_IMPLEMENTATION_MANIFEST: ImplementationIdentity[] = [
     implementationIdentity(WASHER_MODEL, {
@@ -3007,16 +3080,11 @@ export default class WashTowerDevice extends HADevice {
         super(HA, thinq.id)
         thinq.on('data', (f) => this.processData(f))
         const components: DeviceDiscovery['components'] = {}
+        const publicFields = publicFieldKeys(model)
         for (const field of model.fields) {
-            if (field.offset + field.length > model.recordLength) continue
-            const key = componentKey(field.key)
-            components[key] = {
-                platform: 'sensor',
-                unique_id: '$deviceid-' + key,
-                state_topic: '$this/' + key,
-                name: field.label,
-                entity_category: 'diagnostic',
-            } as DeviceDiscovery['components'][string]
+            if (!publicFields.has(field.key) || field.offset + field.length > model.recordLength) continue
+            const key = publicEntityKey(field.key)
+            components[key] = fieldComponent(field)
         }
         const settingKeys = model.tag === 0x33 ? WASHER_SETTING_KEYS : DRYER_SETTING_KEYS
         for (const settingKey of settingKeys) {
@@ -3083,9 +3151,10 @@ export default class WashTowerDevice extends HADevice {
             unique_id: '$deviceid-remote_maintain',
             state_topic: '$this/remote_maintain',
             command_topic: '$this/remote_maintain/set',
-            name: 'Remote control lock',
+            name: 'Keep remote start',
             payload_on: 'On',
             payload_off: 'Off',
+            icon: 'mdi:remote',
         } as DeviceDiscovery['components'][string]
         this.setConfig(
             allowExtendedType({
@@ -3100,15 +3169,19 @@ export default class WashTowerDevice extends HADevice {
         if (!record) return
         this.remoteStartAllowed = false
         this.remoteAllowed = false
+        const trackedFields = trackedFieldKeys(this.model)
+        const publicFields = publicFieldKeys(this.model)
         for (const field of this.model.fields) {
+            if (!trackedFields.has(field.key)) continue
             if (field.offset + field.length > record.length) continue
             let raw = record.readUIntBE(field.offset, field.length)
             if (field.bit !== undefined) {
                 const width = field.bits || 1
                 raw = (raw >> field.bit) & ((1 << width) - 1)
             }
-            const value = field.values ? (field.values[String(raw)] ?? 'Unknown(' + raw + ')') : raw
-            this.publish(componentKey(field.key), value)
+            const value = field.values ? (field.values[String(raw)] ?? 'unknown') : raw
+            if (publicFields.has(field.key) || field.key === 'remoteMaintain')
+                this.publish(field.key === 'remoteMaintain' ? 'remote_maintain' : publicEntityKey(field.key), value)
             this.observed.set(field.key, raw)
             if (!this.dirtyDraftKeys.has(field.key)) this.draft.set(field.key, raw)
             if (field.key === 'state') this.currentState = raw

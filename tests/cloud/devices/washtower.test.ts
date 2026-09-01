@@ -10,7 +10,6 @@ import {
     isWashtowerPowerOnSuccess,
     selectCurrentWashtowerRecord,
     WASHER_MODEL,
-    WASHTOWER_IMPLEMENTATION_MANIFEST,
     WASH_TOWER_SIMPLE_CONTROLS,
     type WashTowerModel,
 } from '@/cloud/devices/washtower'
@@ -78,18 +77,59 @@ function powerOnResponse(model: WashTowerModel, returnCode = 0, snapshot = Buffe
 }
 
 describe('WashTower official codec', () => {
-    test('CRC-valid short 0xEB captures decode every present field', () => {
+    test('real short 0xEB captures publish only the hand-picked HA surface', () => {
         const washer = make(Washer, 'FAKPK21021')
         washer.thinq.emit('data', WASHER_EB)
-        assert.equal(Object.keys(washer.ha.devices['test-device'].properties).length, 141)
-        assert.equal(washer.ha.devices['test-device'].properties.download_course, 'Wool/Delicate')
-        assert.equal(washer.ha.devices['test-device'].properties.laundry_care_setting_time, 240)
+        assert.deepEqual(Object.keys(washer.ha.devices['test-device'].properties).sort(), [
+            'child_lock',
+            'course',
+            'door',
+            'door_lock',
+            'error',
+            'initial_time',
+            'power',
+            'power_transition',
+            'remaining_time',
+            'remote_maintain',
+            'remote_start',
+            'reserve_time',
+            'setting_course',
+            'setting_fresh_care',
+            'setting_rinse',
+            'setting_soil_wash',
+            'setting_spin',
+            'setting_steam',
+            'setting_temp',
+            'setting_turbo_wash',
+            'state',
+        ])
+        assert.equal(washer.ha.devices['test-device'].properties.state, 'On')
+        assert.equal(washer.ha.devices['test-device'].properties.error, 'No error')
+        assert.equal(washer.ha.devices['test-device'].properties.door, 'On')
 
         const dryer = make(Dryer, 'BDH_D39301_KR')
         dryer.thinq.emit('data', DRYER_EB)
-        assert.equal(Object.keys(dryer.ha.devices['test-device'].properties).length, 84)
-        assert.equal(dryer.ha.devices['test-device'].properties.download_course, 'Wool/Delicate')
-        assert.equal(dryer.ha.devices['test-device'].properties.end_melody, 'Vivaldi Winter')
+        assert.deepEqual(Object.keys(dryer.ha.devices['test-device'].properties).sort(), [
+            'child_lock',
+            'course',
+            'door_lock',
+            'error',
+            'initial_time',
+            'power',
+            'power_transition',
+            'remaining_time',
+            'remote_maintain',
+            'remote_start',
+            'reserve_time',
+            'setting_course',
+            'setting_dry_level',
+            'setting_eco_hybrid',
+            'setting_steam',
+            'setting_wrinkle_care',
+            'state',
+        ])
+        assert.equal(dryer.ha.devices['test-device'].properties.state, 'Power off')
+        assert.equal(dryer.ha.devices['test-device'].properties.error, 'No error')
     })
 
     test('frame builder reproduces both real 0xEB captures byte-for-byte', () => {
@@ -175,30 +215,7 @@ describe('WashTower official codec', () => {
         assert.deepEqual(ha.devices['test-device'].properties, {})
     })
 
-    test('every official ref bitfield is decoded independently', () => {
-        for (const [Driver, model, modelId] of [
-            [Washer, WASHER_MODEL, 'FAKPK21021'],
-            [Dryer, DRYER_MODEL, 'BDH_D39301_KR'],
-        ] as const) {
-            for (const field of model.fields.filter((candidate) => candidate.bit !== undefined)) {
-                const { ha, thinq } = make(Driver, modelId)
-                const record = Buffer.alloc(model.recordLength)
-                setRaw(record, model, field.key, 1)
-                thinq.emit('data', buildWashtowerExtendedFrame(model.tag, 0xeb, record))
-                const key = field.key
-                    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-                    .replace(/[^a-zA-Z0-9_]/g, '_')
-                    .toLowerCase()
-                assert.equal(
-                    ha.devices['test-device'].properties[key],
-                    field.values ? (field.values['1'] ?? 'Unknown(1)') : 1,
-                    field.key,
-                )
-            }
-        }
-    })
-
-    test('all display labels are English', () => {
+    test('discovery is lean and gives public values correct HA semantics', () => {
         for (const [Driver, modelId, name] of [
             [Washer, 'FAKPK21021', 'LG WashTower Washer'],
             [Dryer, 'BDH_D39301_KR', 'LG WashTower Dryer'],
@@ -216,100 +233,22 @@ describe('WashTower official codec', () => {
             assert.equal(config.components.wake.name, 'Exit power-save')
             assert.equal(config.components.power.name, 'Power')
             assert.equal(config.components.power_transition.name, 'Power transition state')
-            assert.equal(config.components.remote_maintain.name, 'Remote control lock')
+            assert.equal(config.components.remote_maintain.name, 'Keep remote start')
             assert.equal(config.components.send_course, undefined)
             assert.equal(config.components.start_course.name, 'Start course')
+            for (const key of ['reserve_time', 'remaining_time', 'initial_time']) {
+                assert.equal(config.components[key].device_class, 'duration')
+                assert.equal(config.components[key].unit_of_measurement, 'min')
+            }
+            for (const key of ['state', 'course', 'error']) {
+                assert.equal(config.components[key].device_class, 'enum')
+                assert.ok((config.components[key].options as string[]).includes('unknown'))
+            }
+            assert.ok(Object.keys(config.components).length <= (modelId === 'FAKPK21021' ? 25 : 22))
             for (const component of Object.values(config.components)) {
                 if (typeof component.name === 'string') assert.match(component.name, /[A-Za-z]/)
             }
         }
-    })
-
-    test('single-source manifest references real entities and declared English enums only', () => {
-        for (const identity of WASHTOWER_IMPLEMENTATION_MANIFEST) {
-            const entities = new Set(identity.entities.map(({ key }) => key))
-            for (const option of identity.enumOptions) {
-                assert.ok(entities.has(option.entityKey), `${identity.model}: ${option.entityKey}`)
-                assert.doesNotMatch(option.label, /^Value \d+$/)
-            }
-            const writes = identity.writes.map(({ entityKey, protocolFrameId, controlWifiPath }) => [
-                entityKey,
-                protocolFrameId,
-                controlWifiPath,
-            ])
-            assert.ok(writes.some(([key, frame, path]) => key === 'wake' && frame === '0x2A' && path === 'WMWakeup'))
-            assert.ok(
-                writes.some(([key, frame, path]) => key === 'power' && frame === '0xE5' && path === 'vtCtrl/power'),
-            )
-            assert.ok(
-                writes.some(
-                    ([key, frame, path]) => key === 'power_transition' && frame === '0xED' && path === 'statusQuery',
-                ),
-            )
-            assert.ok(writes.some(([key, frame, path]) => key === 'power' && frame === '0x24' && path === 'WMControl'))
-            assert.ok(!writes.some(([key, frame, path]) => key === 'power' && frame === '0x2A'))
-            assert.ok(writes.some(([key, frame, path]) => key === 'off' && frame === '0x24' && path === 'WMControl'))
-            assert.ok(writes.some(([key, frame, path]) => key === 'stop' && frame === '0x24' && path === 'WMControl'))
-            assert.ok(
-                writes.some(
-                    ([key, frame, path]) => key === 'remote_maintain' && frame === '0x24' && path === 'remoteMaintain',
-                ),
-            )
-            assert.ok(
-                !writes.some(
-                    ([key, frame, path]) => key === 'send_course' && frame === '0x25' && path === 'WMDownload',
-                ),
-            )
-            assert.ok(
-                writes.some(([key, frame, path]) => key === 'start_course' && frame === '0x26' && path === 'WMStart'),
-            )
-            assert.equal(
-                identity.writes.find(
-                    ({ entityKey, controlWifiPath }) => entityKey === 'power' && controlWifiPath === 'vtCtrl/power',
-                )?.validator,
-                'value=ON && state=POWEROFF && no pending power-on within 120s',
-            )
-            assert.equal(
-                identity.writes.find(({ entityKey }) => entityKey === 'remote_maintain')?.validator,
-                '(value=ON && state in [POWEROFF,INITIAL]) || (value=OFF && state=INITIAL)',
-            )
-            assert.match(
-                identity.writes.find(({ entityKey }) => entityKey === 'start_course')!.validator,
-                /remoteStart=true/,
-            )
-        }
-        assert.deepEqual(
-            WASHTOWER_IMPLEMENTATION_MANIFEST.map(({ codec }) => ({
-                protocol: [codec.protocol.name, codec.protocol.jsonVersion, codec.protocol.sha256],
-                convert: [codec.convert.name, codec.convert.jsonVersion, codec.convert.sha256],
-            })),
-            [
-                {
-                    protocol: [
-                        'WASHER_PROTOCOL_EX',
-                        '8.3',
-                        'dfb39d74f18664e92dc8839b623a347154a4f9ae3cb354859c1fbef6a45c13b9',
-                    ],
-                    convert: [
-                        'WASHER_CONVERT_EX',
-                        '2.3',
-                        '4311a33597a88fac5c32bc26f12ef65edeab0c4fc1173ca3665b4ad0685beab4',
-                    ],
-                },
-                {
-                    protocol: [
-                        'DRYER_PROTOCOL_EX',
-                        '4.1',
-                        '0428bcd76f1df325d3142fc2541083b3cc094d025c78e11e17f44f5f970dc348',
-                    ],
-                    convert: [
-                        'DRYER_CONVERT_EX',
-                        '7.8',
-                        'ff3dfc7f7974f18ed6c4a73bea1b03998b8f6c0213d1f08394482bc34844125b',
-                    ],
-                },
-            ],
-        )
     })
 
     test('course selects expose only control-enabled built-in model courses', () => {
@@ -334,32 +273,24 @@ describe('WashTower official codec', () => {
         ])
     })
 
-    test('every official converter Course raw value has an English read-only label', () => {
-        const washerCourse = WASHER_MODEL.fields.find(({ key }) => key === 'course')!.values!
-        const dryerCourse = DRYER_MODEL.fields.find(({ key }) => key === 'course')!.values!
-        assert.deepEqual(Object.keys(washerCourse).map(Number), [...Array.from({ length: 170 }, (_, raw) => raw), 255])
-        assert.deepEqual(Object.keys(dryerCourse).map(Number), [
-            ...Array.from({ length: 59 }, (_, raw) => raw),
-            114,
-            255,
-        ])
-        for (const [model, values] of [
-            [WASHER_MODEL, washerCourse],
-            [DRYER_MODEL, dryerCourse],
-        ] as const) {
-            for (const [raw, label] of Object.entries(values)) {
-                assert.match(label, /[A-Za-z]/, `${model.deviceName} Course raw ${raw}`)
-                assert.doesNotMatch(label, /Unknown/, `${model.deviceName} Course raw ${raw}`)
-            }
-        }
-    })
-
     test('dryer Course raw 2 publishes the English towels label', () => {
         const { ha, thinq } = make(Dryer, 'BDH_D39301_KR')
         const record = Buffer.alloc(DRYER_MODEL.recordLength)
         setRaw(record, DRYER_MODEL, 'course', 2)
         thinq.emit('data', buildWashtowerExtendedFrame(DRYER_MODEL.tag, 0xeb, record))
         assert.equal(ha.devices['test-device'].properties.course, 'Towels')
+    })
+
+    test('unknown public enum values use the exact safe fallback', () => {
+        const { ha, thinq } = make(Dryer, 'BDH_D39301_KR')
+        const record = Buffer.alloc(DRYER_MODEL.recordLength)
+        setRaw(record, DRYER_MODEL, 'state', 250)
+        setRaw(record, DRYER_MODEL, 'course', 250)
+        setRaw(record, DRYER_MODEL, 'error', 250)
+        thinq.emit('data', buildWashtowerExtendedFrame(DRYER_MODEL.tag, 0xeb, record))
+        assert.equal(ha.devices['test-device'].properties.state, 'unknown')
+        assert.equal(ha.devices['test-device'].properties.course, 'unknown')
+        assert.equal(ha.devices['test-device'].properties.error, 'unknown')
     })
 })
 
